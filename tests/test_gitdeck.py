@@ -5,6 +5,7 @@ touches the network (push/pull are exercised only against a local bare repo).
 """
 
 from __future__ import annotations
+import sys
 
 import os
 
@@ -253,6 +254,8 @@ def test_local_push_round_trip(tmp_path):
         remote.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows CI has a real display; main() would open a window and block")
 def test_gui_imports_and_headless_main():
     from gitdeck import gui
     assert gui.main() == 0  # no display -> clean 0, no exception

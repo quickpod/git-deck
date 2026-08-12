@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-r"""GitDeck -- a pure-stdlib tkinter GUI on top of the ``gitdeck`` library.
+r"""GitDeck -- an Aura (QuickOpen design system) GUI on top of the ``gitdeck`` library.
 
-A single main window: a top bar to open a repository, a left sidebar with four
-views (Changes, History, Branches, Remotes) and a main panel that swaps to the
-selected view.  Every operation calls the tested core library (never
-re-implements Git logic); anything that touches the network (fetch/pull/push)
-runs on a background thread and is marshalled back with ``self.after``.  Failures
-are shown in a clear inline result bar as the :class:`GitDeckError` message --
-never a raw traceback.
+A single Aura window with a sidebar of sections -- **Changes** (stage / diff /
+commit), **History** (a live commit-graph canvas + per-commit diff), **Branches**
+(create / checkout / merge / delete) and **Remotes** (add + fetch / pull / push),
+plus an **About** panel.  Every operation calls the tested core library (never
+re-implements Git logic, always via pure-Python dulwich -- never shelling out to
+a ``git`` binary); anything that touches the network (fetch/pull/push) runs on a
+background thread and is marshalled back with ``self.after``.  Failures are shown
+in the Aura status bar as the :class:`GitDeckError` message -- never a traceback.
 
 Design goals baked in here (mirroring the QuickOpen house style):
-  * pure standard-library tkinter/ttk -- NO third-party GUI deps.  Dark mode is
-    a ttk-style + palette swap.
+  * built on the vendored ``gitdeck/aura.py`` design system, which layers the
+    quickopen.ai look (deep space + light) over CustomTkinter.  Runtime deps:
+    ``customtkinter`` (+ ``darkdetect``) -- declared in requirements.txt; the
+    PyInstaller build adds ``--collect-all customtkinter``.
   * Importing this module does nothing.  Only :func:`main` builds a root window,
-    and it degrades gracefully (prints a message, returns 0) with no display.
+    and it degrades gracefully (prints a message, returns 0) with no display or
+    with customtkinter missing.
   * Frozen-exe safe: bundled assets are resolved via ``sys._MEIPASS`` / the exe
     directory when ``sys.frozen`` is set -- never ``__file__``.
+  * The diff/commit-message viewers are raw ``tk.Text`` widgets and the history
+    graph is a raw ``tk.Canvas``, all registered with ``aura.track`` so they
+    re-theme when the sidebar toggle flips dark<->light; the graph re-renders on
+    the flip so its accent-coloured nodes/edges follow the theme.
 
 100% AI-built, open source, published on QuickOpen (quickopen.ai).
 """
@@ -26,13 +34,15 @@ import os
 import sys
 import threading
 
-# tkinter is imported lazily inside main()/build_app so that merely importing
-# this module (e.g. during packaging or on a headless CI box) never fails.
+# tkinter/customtkinter are imported lazily inside main()/build_app so that
+# merely importing this module (e.g. during packaging or on a headless CI box)
+# never fails.
 
 APP_NAME = "GitDeck"
 APP_VERSION = "1.0.0"
 WINDOW_TITLE = "GitDeck — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
+ACCENT = "#cf2d3a"      # publish/specs/git-deck.json "accent": [207, 45, 58]
 
 DEFAULT_AUTHOR = "GitDeck User <gitdeck@localhost>"
 
@@ -41,25 +51,8 @@ VIEWS = [
     ("history", "History"),
     ("branches", "Branches"),
     ("remotes", "Remotes"),
+    ("about", "About"),
 ]
-
-# ---- colour palettes (mirror the QuickOpen palette) -------------------------
-PALETTES = {
-    "light": {
-        "bg": "#f5f7fa", "surface": "#ffffff", "text": "#141820",
-        "muted": "#5b6472", "primary": "#2f5fe0", "primary_hi": "#2450c8",
-        "entry": "#ffffff", "border": "#d5dae2", "sel": "#2f5fe0",
-        "sel_fg": "#ffffff", "trough": "#e2e7ef", "ok": "#1f7a3d",
-        "err": "#c0392b", "add": "#1f7a3d", "del": "#c0392b",
-    },
-    "dark": {
-        "bg": "#0f1115", "surface": "#1a1e24", "text": "#f1f3f7",
-        "muted": "#9aa4b2", "primary": "#5b86f7", "primary_hi": "#7098ff",
-        "entry": "#1a1e24", "border": "#2a2f38", "sel": "#5b86f7",
-        "sel_fg": "#0f1115", "trough": "#2a2f38", "ok": "#5bd68a",
-        "err": "#ff6b5e", "add": "#5bd68a", "del": "#ff6b5e",
-    },
-}
 
 
 # ---------------------------------------------------------------------------
@@ -105,48 +98,68 @@ def open_with_default_app(path):
 
 
 # ---------------------------------------------------------------------------
-# The app (built lazily; tkinter imported only inside build_app/main)
+# The app (built lazily; tkinter/customtkinter imported only inside build_app)
 # ---------------------------------------------------------------------------
 def build_app():
-    """Construct and return the App class bound to a live tkinter import.
+    """Construct and return the App class bound to live GUI imports.
 
-    Kept inside a function so this module imports cleanly without a display.
+    Kept inside a function so this module imports cleanly without a display
+    (and without customtkinter installed).
     """
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    import customtkinter as ctk
 
-    from . import guiconfig
+    from . import aura, guiconfig
     from .errors import GitDeckError
+    # These names are re-exported *functions* from gitdeck/__init__ (the package
+    # attribute is the function, not a module) -- import them directly.
     from . import (
         is_repo, init_repo, status, current_branch,
-        log, commit_graph, file_diff, commit_diff,
+        commit_graph, file_diff, commit_diff,
         stage, unstage, commit,
         branches, create_branch, checkout, merge, delete_branch,
         remotes, add_remote, fetch, pull, push,
     )
 
-    FONT = "Segoe UI"
-    MONO = "Consolas"
+    FONT = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+    MONO = "Consolas" if os.name == "nt" else "DejaVu Sans Mono"
 
-    class App(tk.Tk):
+    class App(aura.AuraApp):
         def __init__(self):
-            super().__init__()
-            self.title(WINDOW_TITLE)
-            self.geometry("1120x720")
-            self.minsize(920, 600)
+            super().__init__(
+                title=WINDOW_TITLE, app_name=APP_NAME, accent=ACCENT,
+                theme=guiconfig.get_theme(),
+                icon_png=asset_path("git-deck.png"), version=APP_VERSION,
+                tagline="visual git",
+                on_theme_change=guiconfig.set_theme,
+                size=(1160, 740), min_size=(940, 600))
 
-            self.theme = guiconfig.get_theme()
             self.repo_path = None
             self._busy = False
-            self._tracked = []       # (tk_widget, role) for manual re-theming
             self._img_refs = []
-            self._panels = {}
-            self._current_view = None
+            self._diff_texts = []        # tk.Text panes needing diff re-tagging
+            self._graph = None           # last commit_graph() result
+            self._graph_canvas = None
+            self._selected_row = None
 
             self._set_icon()
+            self._build_header_extras()
             self._build_menu()
-            self._build_layout()
-            self._apply_theme()
+            self.add_section("changes", "Changes", "✎", self._build_changes)
+            self.add_section("history", "History", "◷", self._build_history)
+            self.add_section("branches", "Branches", "◈", self._build_branches)
+            self.add_section("remotes", "Remotes", "⇄", self._build_remotes)
+            self.add_section("about", "About", "ℹ", self._build_about)
+            # per-section repopulate hooks (used by refresh / opening a repo)
+            self._section_refresh = {
+                "changes": self._refresh_changes,
+                "history": self._load_history,
+                "branches": self._refresh_branches,
+                "remotes": self._refresh_remotes,
+            }
+            self.show("changes")
+            self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self.destroy)
             self.after(50, self._open_last_or_prompt)
 
@@ -154,7 +167,7 @@ def build_app():
         def _set_icon(self):
             try:
                 ico = asset_path("git-deck.ico")
-                if ico:
+                if ico and os.name == "nt":
                     self.iconbitmap(ico)
                     return
             except Exception:
@@ -168,107 +181,27 @@ def build_app():
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        # ---- theming -------------------------------------------------------
-        def track(self, widget, role):
-            self._tracked.append((widget, role))
+        # ---- header (repo indicator + Open Repo action) --------------------
+        def _build_header_extras(self):
+            self._repo_caption = aura.Caption(self.header_actions,
+                                              "No repository open")
+            self._repo_caption.pack(side="left", padx=(0, 10))
+            aura.AuraButton(self.header_actions, "Open repo…", kind="secondary",
+                            height=30,
+                            command=self._open_repo_dialog).pack(side="left")
 
-        def _pal(self):
-            return PALETTES[self.theme]
-
-        def _apply_theme(self):
-            p = self._pal()
-            style = ttk.Style(self)
+        # ---- theme flip: re-colour diff tags + redraw the graph ------------
+        def set_theme(self, theme):
+            super().set_theme(theme)
+            for txt in list(self._diff_texts):
+                self._retag_diff(txt)
             try:
-                style.theme_use("clam")
+                if (self._graph_canvas is not None
+                        and self._graph_canvas.winfo_exists()
+                        and self._graph is not None):
+                    self._render_graph()
             except Exception:
                 pass
-            self.configure(bg=p["bg"])
-            style.configure(".", background=p["bg"], foreground=p["text"],
-                            fieldbackground=p["entry"], bordercolor=p["border"],
-                            font=(FONT, 10))
-            style.configure("TFrame", background=p["bg"])
-            style.configure("Sidebar.TFrame", background=p["surface"])
-            style.configure("Card.TFrame", background=p["surface"])
-            style.configure("TLabel", background=p["bg"], foreground=p["text"])
-            style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Header.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 15, "bold"))
-            style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Brand.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 12, "bold"))
-            style.configure("Status.TLabel", background=p["surface"],
-                            foreground=p["muted"])
-            style.configure("TButton", background=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], focuscolor=p["surface"],
-                            padding=(10, 5))
-            style.map("TButton",
-                      background=[("active", p["trough"]), ("disabled", p["bg"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Accent.TButton", background=p["primary"],
-                            foreground="#ffffff", padding=(12, 6))
-            style.map("Accent.TButton",
-                      background=[("active", p["primary_hi"]),
-                                  ("disabled", p["border"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Toggle.TButton", background=p["surface"],
-                            foreground=p["text"], padding=(8, 4))
-            style.configure("Nav.TButton", background=p["surface"],
-                            foreground=p["text"], anchor="w", padding=(14, 8))
-            style.map("Nav.TButton", background=[("active", p["trough"])])
-            style.configure("NavActive.TButton", background=p["primary"],
-                            foreground="#ffffff", anchor="w", padding=(14, 8))
-            style.map("NavActive.TButton", background=[("active", p["primary_hi"])])
-            for name in ("TEntry", "TSpinbox"):
-                style.configure(name, fieldbackground=p["entry"], foreground=p["text"],
-                                insertcolor=p["text"], bordercolor=p["border"])
-            style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-            style.map("TCheckbutton", background=[("active", p["bg"])])
-            style.configure("TLabelframe", background=p["bg"], foreground=p["text"],
-                            bordercolor=p["border"])
-            style.configure("TLabelframe.Label", background=p["bg"],
-                            foreground=p["muted"])
-            style.configure("Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], rowheight=24)
-            style.map("Treeview", background=[("selected", p["primary"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("TScrollbar", background=p["surface"],
-                            troughcolor=p["bg"], bordercolor=p["border"],
-                            arrowcolor=p["text"])
-            style.configure("TSeparator", background=p["border"])
-
-            for widget, role in list(self._tracked):
-                try:
-                    if role == "listbox":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         selectbackground=p["primary"],
-                                         selectforeground=p["sel_fg"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"],
-                                         borderwidth=0)
-                    elif role == "text":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         insertbackground=p["text"],
-                                         selectbackground=p["primary"],
-                                         selectforeground=p["sel_fg"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"],
-                                         borderwidth=0)
-                        try:
-                            widget.tag_configure("add", foreground=p["add"])
-                            widget.tag_configure("del", foreground=p["del"])
-                            widget.tag_configure("hunk", foreground=p["primary"])
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-        def toggle_theme(self):
-            self.theme = "dark" if self.theme == "light" else "light"
-            guiconfig.set_theme(self.theme)
-            self._apply_theme()
-            self._theme_btn.configure(
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
 
         # ---- menu ----------------------------------------------------------
         def _build_menu(self):
@@ -286,13 +219,16 @@ def build_app():
             bar.add_cascade(label="File", menu=filem)
 
             viewm = tk.Menu(bar, tearoff=0)
-            viewm.add_command(label="Toggle dark mode", command=self.toggle_theme)
+            viewm.add_command(
+                label="Toggle dark mode",
+                command=lambda: self.set_theme(
+                    "light" if self.theme == "dark" else "dark"))
             viewm.add_command(label="Refresh", accelerator="F5",
                               command=self.refresh)
             bar.add_cascade(label="View", menu=viewm)
 
             helpm = tk.Menu(bar, tearoff=0)
-            helpm.add_command(label="About", command=self._about)
+            helpm.add_command(label="About", command=lambda: self.show("about"))
             helpm.add_command(label="Open project page (quickopen.ai)",
                               command=lambda: open_with_default_app(PROJECT_URL))
             bar.add_cascade(label="Help", menu=helpm)
@@ -320,72 +256,15 @@ def build_app():
             guiconfig.clear_recent()
             self._fill_recent_menu()
 
-        def _about(self):
-            messagebox.showinfo(
-                "About GitDeck",
-                f"{APP_NAME} {APP_VERSION}\n\nA friendly, offline, 100% open-source "
-                f"Git client built on pure-Python dulwich.\n\nPublished on "
-                f"QuickOpen (quickopen.ai). Apache-2.0.")
-
-        # ---- layout --------------------------------------------------------
-        def _build_layout(self):
-            top = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 8))
-            top.pack(fill="x", side="top")
-            ttk.Label(top, text="GitDeck", style="Brand.TLabel").pack(side="left")
-            self.repo_lbl = ttk.Label(top, style="Status.TLabel",
-                                      text="  no repository open")
-            self.repo_lbl.pack(side="left")
-            self._theme_btn = ttk.Button(
-                top, style="Toggle.TButton", command=self.toggle_theme,
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
-            self._theme_btn.pack(side="right")
-            ttk.Button(top, text="Open Repo…", command=self._open_repo_dialog,
-                       style="Toggle.TButton").pack(side="right", padx=(0, 6))
-
-            body = ttk.Frame(self, style="TFrame")
-            body.pack(fill="both", expand=True)
-
-            side = ttk.Frame(body, style="Sidebar.TFrame", width=180)
-            side.pack(side="left", fill="y")
-            side.pack_propagate(False)
-            self._nav_btns = {}
-            for vid, label in VIEWS:
-                b = ttk.Button(side, text=label, style="Nav.TButton",
-                               command=(lambda v=vid: self.select_view(v)))
-                b.pack(fill="x", padx=6, pady=(6, 0))
-                self._nav_btns[vid] = b
-
-            self.main = ttk.Frame(body, style="TFrame", padding=(16, 12))
-            self.main.pack(side="left", fill="both", expand=True)
-
-            self.container = ttk.Frame(self.main, style="TFrame")
-            self.container.pack(fill="both", expand=True)
-
-            # bottom result bar
-            bar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 6))
-            bar.pack(fill="x", side="bottom")
-            self.status_lbl = ttk.Label(bar, style="Status.TLabel", text="Ready")
-            self.status_lbl.pack(side="left")
-            self.result_lbl = ttk.Label(bar, style="Status.TLabel", text="")
-            self.result_lbl.pack(side="left", padx=(12, 0))
-
-        # ---- result bar helpers -------------------------------------------
+        # ---- status helpers (Aura StatusBar is the single voice) -----------
         def _set_status(self, text, kind="idle"):
-            p = self._pal()
-            color = {"working": p["primary"], "ok": p["ok"], "err": p["err"]}.get(
-                kind, p["muted"])
-            self.status_lbl.configure(text=text, foreground=color)
+            self.set_status(text, kind)
 
         def _show_error(self, message):
-            self.result_lbl.configure(text="✕ " + str(message),
-                                      foreground=self._pal()["err"])
+            self.set_error(str(message))
 
         def _show_ok(self, message):
-            self.result_lbl.configure(text="✓ " + str(message),
-                                      foreground=self._pal()["ok"])
-
-        def _clear_result(self):
-            self.result_lbl.configure(text="")
+            self.set_success(str(message))
 
         # ---- background runner (for network ops) --------------------------
         def _bg(self, work, on_ok, busy="Working…", success="Done"):
@@ -399,7 +278,6 @@ def build_app():
                 return
             self._busy = True
             self._set_status(busy, kind="working")
-            self._clear_result()
 
             def run():
                 try:
@@ -413,7 +291,6 @@ def build_app():
             def finish(res, err):
                 self._busy = False
                 if err is not None:
-                    self._set_status("Error", kind="err")
                     self._show_error(err)
                     return
                 self._set_status(success, kind="ok")
@@ -429,11 +306,9 @@ def build_app():
             try:
                 result = work()
             except GitDeckError as ex:
-                self._set_status("Error", kind="err")
                 self._show_error(ex)
                 return None
             except Exception as ex:
-                self._set_status("Error", kind="err")
                 self._show_error(f"Unexpected error: {ex}")
                 return None
             self._set_status(success, kind="ok")
@@ -446,7 +321,8 @@ def build_app():
                 if os.path.isdir(path) and is_repo(path):
                     self.set_repo(path)
                     return
-            self.select_view("changes")
+            self.set_status("Open a repository to get started "
+                            "(File → Open Repository).")
 
         def _open_repo_dialog(self):
             path = filedialog.askdirectory(title="Open a Git repository")
@@ -456,7 +332,9 @@ def build_app():
                 if messagebox.askyesno(
                         "Not a repository",
                         f"{path} is not a Git repository.\n\nInitialise one here?"):
-                    self._do(lambda: init_repo(path), success="Initialised")
+                    if self._do(lambda: init_repo(path),
+                                success="Initialised") is None:
+                        return
                 else:
                     return
             self.set_repo(path)
@@ -475,41 +353,36 @@ def build_app():
             branch = ""
             try:
                 cb = current_branch(path)
-                branch = f"  on {cb}" if cb else ""
+                branch = f"  ·  on {cb}" if cb else ""
             except Exception:
                 pass
-            self.repo_lbl.configure(text=f"  {path}{branch}")
-            self._clear_result()
-            self.select_view(self._current_view or "changes", force=True)
+            self._repo_caption.configure(
+                text=f"{os.path.basename(os.path.normpath(path))}{branch}")
+            self.set_status(f"{path}{branch}")
+            self.refresh()
 
         def refresh(self):
-            if self.repo_path:
-                self.set_repo(self.repo_path)
-
-        # ---- view switching -----------------------------------------------
-        def select_view(self, vid, force=False):
-            if vid == self._current_view and not force:
-                return
-            self._current_view = vid
-            for k, b in self._nav_btns.items():
-                b.configure(style="NavActive.TButton" if k == vid else "Nav.TButton")
-            for child in self.container.winfo_children():
-                child.destroy()
-            builder = {
-                "changes": self._build_changes,
-                "history": self._build_history,
-                "branches": self._build_branches,
-                "remotes": self._build_remotes,
-            }[vid]
+            """Repopulate every already-built section from the current repo."""
             if not self.repo_path:
-                ttk.Label(self.container, style="Sub.TLabel",
-                          text="Open a repository to get started "
-                               "(File → Open Repository).").pack(anchor="w")
                 return
-            builder(self.container)
+            for sid, fn in self._section_refresh.items():
+                sec = self._sections.get(sid)
+                if sec and sec.get("built"):
+                    fn()
 
-        def _text_pane(self, parent, height=14):
-            frame = ttk.Frame(parent, style="TFrame")
+        # ---- raw tk.Text diff pane (tracked + diff-tagged) ----------------
+        def _retag_diff(self, txt):
+            try:
+                if not txt.winfo_exists():
+                    return
+                txt.tag_configure("add", foreground=aura.P("ok"))
+                txt.tag_configure("del", foreground=aura.P("danger"))
+                txt.tag_configure("hunk", foreground=aura.P("accent"))
+            except Exception:
+                pass
+
+        def _text_pane(self, parent, height=12):
+            frame = ctk.CTkFrame(parent, fg_color="transparent")
             txt = tk.Text(frame, height=height, wrap="none", font=(MONO, 10),
                           borderwidth=0)
             sb = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
@@ -519,7 +392,9 @@ def build_app():
             sb.pack(side="right", fill="y")
             sbx.pack(side="bottom", fill="x")
             txt.pack(side="left", fill="both", expand=True)
-            self.track(txt, "text")
+            aura.track(txt, "text")
+            self._diff_texts.append(txt)
+            self._retag_diff(txt)
             return frame, txt
 
         def _set_diff(self, txt, text):
@@ -539,65 +414,72 @@ def build_app():
                     txt.insert("end", line, tag)
             txt.configure(state="disabled")
 
-        # ---- Changes view --------------------------------------------------
-        def _build_changes(self, parent):
-            ttk.Label(parent, text="Changes", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(parent, style="Sub.TLabel",
-                      text="Stage changes, review the diff, then commit.").pack(
-                anchor="w", pady=(0, 8))
+        # =================================================================
+        # Changes section
+        # =================================================================
+        def _build_changes(self, frame):
+            aura.Caption(frame,
+                         "Stage changes, review the diff, then commit.").pack(
+                anchor="w", pady=(0, 10))
 
-            body = ttk.Frame(parent, style="TFrame")
+            body = ctk.CTkFrame(frame, fg_color="transparent")
             body.pack(fill="both", expand=True)
 
-            lists = ttk.Frame(body, style="TFrame")
+            lists = ctk.CTkFrame(body, fg_color="transparent")
             lists.pack(side="left", fill="y")
 
-            ttk.Label(lists, text="Staged", style="Sub.TLabel").pack(anchor="w")
+            aura.SectionLabel(lists, "STAGED").pack(anchor="w")
             self._staged_lb = tk.Listbox(lists, height=8, width=34,
-                                         selectmode="extended", exportselection=False,
-                                         activestyle="none")
-            self._staged_lb.pack(fill="x")
-            self.track(self._staged_lb, "listbox")
-            ttk.Button(lists, text="Unstage selected",
-                       command=self._on_unstage).pack(fill="x", pady=(4, 10))
+                                         selectmode="extended",
+                                         exportselection=False)
+            self._staged_lb.pack(fill="x", pady=(2, 0))
+            aura.track(self._staged_lb, "listbox")
+            aura.AuraButton(lists, "Unstage selected", kind="secondary",
+                            command=self._on_unstage).pack(fill="x", pady=(6, 12))
 
-            ttk.Label(lists, text="Unstaged / Untracked",
-                      style="Sub.TLabel").pack(anchor="w")
+            aura.SectionLabel(lists, "UNSTAGED / UNTRACKED").pack(anchor="w")
             self._unstaged_lb = tk.Listbox(lists, height=10, width=34,
                                            selectmode="extended",
-                                           exportselection=False, activestyle="none")
-            self._unstaged_lb.pack(fill="x")
-            self.track(self._unstaged_lb, "listbox")
-            ttk.Button(lists, text="Stage selected",
-                       command=self._on_stage).pack(fill="x", pady=(4, 0))
-            ttk.Button(lists, text="Stage all",
-                       command=self._on_stage_all).pack(fill="x", pady=(4, 0))
+                                           exportselection=False)
+            self._unstaged_lb.pack(fill="x", pady=(2, 0))
+            aura.track(self._unstaged_lb, "listbox")
+            stage_row = ctk.CTkFrame(lists, fg_color="transparent")
+            stage_row.pack(fill="x", pady=(6, 0))
+            aura.AuraButton(stage_row, "Stage selected", kind="secondary",
+                            command=self._on_stage).pack(side="left")
+            aura.AuraButton(stage_row, "Stage all", kind="secondary",
+                            command=self._on_stage_all).pack(
+                side="left", padx=(8, 0))
 
-            right = ttk.Frame(body, style="TFrame")
-            right.pack(side="left", fill="both", expand=True, padx=(12, 0))
+            right = ctk.CTkFrame(body, fg_color="transparent")
+            right.pack(side="left", fill="both", expand=True, padx=(16, 0))
             diff_frame, self._changes_diff = self._text_pane(right, height=12)
             diff_frame.pack(fill="both", expand=True)
 
-            commit_box = ttk.Labelframe(right, text="Commit", padding=8)
-            commit_box.pack(fill="x", pady=(10, 0))
-            self._commit_msg = tk.Text(commit_box, height=3, wrap="word",
+            commit_box = aura.Card(right, title="Commit")
+            commit_box.pack(fill="x", pady=(12, 0))
+            self._commit_msg = tk.Text(commit_box.body, height=3, wrap="word",
                                        font=(FONT, 10), borderwidth=0)
             self._commit_msg.pack(fill="x")
-            self.track(self._commit_msg, "text")
-            row = ttk.Frame(commit_box, style="TFrame")
-            row.pack(fill="x", pady=(6, 0))
-            ttk.Label(row, text="Author:", style="Sub.TLabel").pack(side="left")
-            self._author_var = tk.StringVar(value=DEFAULT_AUTHOR)
-            ttk.Entry(row, textvariable=self._author_var).pack(
-                side="left", fill="x", expand=True, padx=(6, 6))
-            ttk.Button(row, text="Commit", style="Accent.TButton",
-                       command=self._on_commit).pack(side="right")
+            aura.track(self._commit_msg, "text")
+            row = ctk.CTkFrame(commit_box.body, fg_color="transparent")
+            row.pack(fill="x", pady=(8, 0))
+            aura.Caption(row, "Author").pack(side="left", padx=(0, 6))
+            # No textvariable: keep it a plain entry pre-filled with the default.
+            self._author_entry = aura.AuraEntry(row)
+            self._author_entry.insert(0, DEFAULT_AUTHOR)
+            self._author_entry.pack(side="left", fill="x", expand=True,
+                                    padx=(0, 8))
+            aura.AuraButton(row, "Commit", kind="primary",
+                            command=self._on_commit).pack(side="right")
 
             for lb in (self._staged_lb, self._unstaged_lb):
                 lb.bind("<<ListboxSelect>>", self._on_change_select)
             self._refresh_changes()
 
         def _refresh_changes(self):
+            if not self.repo_path:
+                return
             snap = self._do(lambda: status(self.repo_path), success="Refreshed")
             if snap is None:
                 return
@@ -655,7 +537,7 @@ def build_app():
 
         def _on_commit(self):
             message = self._commit_msg.get("1.0", "end").strip()
-            author = self._author_var.get().strip() or DEFAULT_AUTHOR
+            author = self._author_entry.get().strip() or DEFAULT_AUTHOR
             if not message:
                 self._show_error("Enter a commit message first.")
                 return
@@ -666,91 +548,174 @@ def build_app():
                 self._commit_msg.delete("1.0", "end")
                 self._show_ok(f"Committed {sha[:7]}")
                 self._refresh_changes()
+                self._load_history()
 
-        # ---- History view --------------------------------------------------
-        def _build_history(self, parent):
-            ttk.Label(parent, text="History", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(parent, style="Sub.TLabel",
-                      text="Browse commits; select one to see what it changed.").pack(
-                anchor="w", pady=(0, 8))
+        # =================================================================
+        # History section (commit-graph canvas + per-commit diff)
+        # =================================================================
+        def _build_history(self, frame):
+            aura.Caption(frame,
+                         "Browse commits as a graph; select one to see what "
+                         "it changed.").pack(anchor="w", pady=(0, 10))
 
-            top = ttk.Frame(parent, style="TFrame")
-            top.pack(fill="both", expand=True)
-
-            cols = ("graph", "sha", "author", "date", "summary")
-            tree = ttk.Treeview(top, columns=cols, show="headings", height=12,
-                                selectmode="browse")
-            for c, w in (("graph", 60), ("sha", 80), ("author", 180),
-                         ("date", 170), ("summary", 380)):
-                tree.heading(c, text=c.title())
-                tree.column(c, width=w, anchor="w")
-            sb = ttk.Scrollbar(top, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=sb.set)
+            graph_frame = ctk.CTkFrame(frame, fg_color="transparent")
+            graph_frame.pack(fill="both", expand=True)
+            canvas = tk.Canvas(graph_frame, highlightthickness=0, bd=0)
+            sb = ttk.Scrollbar(graph_frame, orient="vertical",
+                               command=canvas.yview)
+            canvas.configure(yscrollcommand=sb.set)
             sb.pack(side="right", fill="y")
-            tree.pack(side="left", fill="both", expand=True)
-            self._history_tree = tree
+            canvas.pack(side="left", fill="both", expand=True)
+            aura.track(canvas, "canvas")
+            canvas.bind("<Button-1>", self._on_graph_click)
+            self._graph_canvas = canvas
 
-            diff_frame, self._history_diff = self._text_pane(parent, height=12)
-            diff_frame.pack(fill="both", expand=True, pady=(10, 0))
+            diff_frame, self._history_diff = self._text_pane(frame, height=12)
+            diff_frame.pack(fill="both", expand=True, pady=(12, 0))
 
+            self._load_history()
+
+        def _load_history(self):
+            if not getattr(self, "_graph_canvas", None):
+                return
+            if not self.repo_path:
+                self._graph = None
+                self._selected_row = None
+                try:
+                    self._graph_canvas.delete("all")
+                    self._set_diff(self._history_diff, "")
+                except Exception:
+                    pass
+                return
             graph = self._do(lambda: commit_graph(self.repo_path, max=200))
             if graph is None:
                 return
-            self._history_sha = {}
-            for node in graph["nodes"]:
-                rail = ("│ " * node["lane"]) + "●"
-                iid = tree.insert("", "end", values=(
-                    rail, node["sha"][:7], node["author"],
-                    node["date"], node["summary"]))
-                self._history_sha[iid] = node["sha"]
-            tree.bind("<<TreeviewSelect>>", self._on_history_select)
+            self._graph = graph
+            self._selected_row = None
+            self._render_graph()
             if not graph["nodes"]:
                 self._set_diff(self._history_diff, "")
 
-        def _on_history_select(self, event):
-            sel = self._history_tree.selection()
-            if not sel:
+        # Layout constants for the graph rail.
+        _ROW_H = 26
+        _X0 = 18
+        _LANE_W = 16
+        _DOT_R = 4
+
+        def _render_graph(self):
+            c = self._graph_canvas
+            c.delete("all")
+            graph = self._graph or {"nodes": [], "edges": []}
+            nodes = graph["nodes"]
+            row_h, x0, lane_w, r = (self._ROW_H, self._X0, self._LANE_W,
+                                    self._DOT_R)
+            accent = aura.P("accent")
+            surface = aura.P("surface")
+            text_c = aura.P("text")
+            muted = aura.P("muted")
+            faint = aura.P("faint")
+            edge_c = aura.mix(accent, aura.P("bg"), 0.45)
+
+            pos = {n["sha"]: (n["lane"], i) for i, n in enumerate(nodes)}
+            max_lane = max((n["lane"] for n in nodes), default=0)
+            text_x = x0 + (max_lane + 1) * lane_w + 12
+            big_w = max(2000, c.winfo_width())
+
+            # selection highlight (behind everything)
+            if (self._selected_row is not None
+                    and 0 <= self._selected_row < len(nodes)):
+                y = self._selected_row * row_h
+                c.create_rectangle(0, y, big_w, y + row_h,
+                                   fill=aura.P("accent_soft"), width=0)
+
+            # edges (child -> parent), drawn under the nodes
+            for child, parent in graph["edges"]:
+                if child in pos and parent in pos:
+                    cl, ci = pos[child]
+                    pl, pi = pos[parent]
+                    x1 = x0 + cl * lane_w
+                    y1 = ci * row_h + row_h // 2
+                    x2 = x0 + pl * lane_w
+                    y2 = pi * row_h + row_h // 2
+                    c.create_line(x1, y1, x2, y2, fill=edge_c, width=2)
+
+            # nodes + text
+            for i, node in enumerate(nodes):
+                lane = node["lane"]
+                x = x0 + lane * lane_w
+                y = i * row_h + row_h // 2
+                c.create_oval(x - r, y - r, x + r, y + r,
+                              fill=accent, outline=surface, width=1)
+                c.create_text(text_x, y, anchor="w", text=node["sha"][:7],
+                              fill=muted, font=(MONO, 9))
+                summary = (node.get("summary") or "").strip()
+                if len(summary) > 60:
+                    summary = summary[:59] + "…"
+                sid = c.create_text(text_x + 62, y, anchor="w", text=summary,
+                                    fill=text_c, font=(FONT, 9))
+                author = (node.get("author") or "").split("<")[0].strip()
+                date = (node.get("date") or "")[:16]
+                meta = f"   {author}  ·  {date}".rstrip()
+                bbox = c.bbox(sid)
+                meta_x = (bbox[2] + 14) if bbox else text_x + 200
+                c.create_text(meta_x, y, anchor="w", text=meta,
+                              fill=faint, font=(FONT, 9))
+
+            c.configure(scrollregion=(0, 0, big_w, max(1, len(nodes)) * row_h))
+
+        def _on_graph_click(self, event):
+            if not self._graph or not self._graph["nodes"]:
                 return
-            sha = self._history_sha.get(sel[0])
+            row = int(self._graph_canvas.canvasy(event.y) // self._ROW_H)
+            nodes = self._graph["nodes"]
+            if not (0 <= row < len(nodes)):
+                return
+            self._selected_row = row
+            self._render_graph()
+            sha = nodes[row]["sha"]
             text = self._do(lambda: commit_diff(self.repo_path, sha))
             self._set_diff(self._history_diff, text or "")
 
-        # ---- Branches view -------------------------------------------------
-        def _build_branches(self, parent):
-            ttk.Label(parent, text="Branches", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(parent, style="Sub.TLabel",
-                      text="Create, switch, merge and delete local branches.").pack(
-                anchor="w", pady=(0, 8))
+        # =================================================================
+        # Branches section
+        # =================================================================
+        def _build_branches(self, frame):
+            aura.Caption(frame,
+                         "Create, switch, merge and delete local branches.").pack(
+                anchor="w", pady=(0, 10))
 
-            body = ttk.Frame(parent, style="TFrame")
+            body = ctk.CTkFrame(frame, fg_color="transparent")
             body.pack(fill="both", expand=True)
 
             self._branch_lb = tk.Listbox(body, height=14, width=36,
-                                         exportselection=False, activestyle="none")
+                                         exportselection=False)
             self._branch_lb.pack(side="left", fill="y")
-            self.track(self._branch_lb, "listbox")
+            aura.track(self._branch_lb, "listbox")
 
-            btns = ttk.Frame(body, style="TFrame")
-            btns.pack(side="left", fill="y", padx=(12, 0))
+            btns = ctk.CTkFrame(body, fg_color="transparent")
+            btns.pack(side="left", fill="y", padx=(16, 0))
 
-            new_row = ttk.Frame(btns, style="TFrame")
+            new_row = ctk.CTkFrame(btns, fg_color="transparent")
             new_row.pack(fill="x")
-            self._new_branch_var = tk.StringVar()
-            ttk.Entry(new_row, textvariable=self._new_branch_var, width=20).pack(
-                side="left", padx=(0, 6))
-            ttk.Button(new_row, text="Create", style="Accent.TButton",
-                       command=self._on_create_branch).pack(side="left")
+            self._new_branch_entry = aura.AuraEntry(
+                new_row, placeholder="New branch name…", width=200)
+            self._new_branch_entry.pack(side="left", padx=(0, 8))
+            aura.AuraButton(new_row, "Create", kind="primary",
+                            command=self._on_create_branch).pack(side="left")
 
-            ttk.Button(btns, text="Checkout selected",
-                       command=self._on_checkout).pack(fill="x", pady=(12, 0))
-            ttk.Button(btns, text="Merge selected → current",
-                       command=self._on_merge).pack(fill="x", pady=(6, 0))
-            ttk.Button(btns, text="Delete selected",
-                       command=self._on_delete_branch).pack(fill="x", pady=(6, 0))
+            aura.AuraButton(btns, "Checkout selected", kind="secondary",
+                            command=self._on_checkout).pack(fill="x", pady=(12, 0))
+            aura.AuraButton(btns, "Merge selected → current", kind="secondary",
+                            command=self._on_merge).pack(fill="x", pady=(8, 0))
+            aura.AuraButton(btns, "Delete selected", kind="danger",
+                            command=self._on_delete_branch).pack(
+                fill="x", pady=(8, 0))
 
             self._refresh_branches()
 
         def _refresh_branches(self):
+            if not self.repo_path:
+                return
             names = self._do(lambda: branches(self.repo_path), success="Refreshed")
             if names is None:
                 return
@@ -769,13 +734,13 @@ def build_app():
             return self._branch_names[sel[0]]
 
         def _on_create_branch(self):
-            name = self._new_branch_var.get().strip()
+            name = self._new_branch_entry.get().strip()
             if not name:
                 self._show_error("Enter a branch name first.")
                 return
             if self._do(lambda: create_branch(self.repo_path, name),
                         success="Branch created") is not None:
-                self._new_branch_var.set("")
+                self._new_branch_entry.delete(0, "end")
                 self._refresh_branches()
 
         def _on_checkout(self):
@@ -804,14 +769,13 @@ def build_app():
             if not name:
                 self._show_error("Select a branch to merge first.")
                 return
-            author = getattr(self, "_author_var", None)
+            author = getattr(self, "_author_entry", None)
             author = author.get().strip() if author else DEFAULT_AUTHOR
             result = self._do(
                 lambda: merge(self.repo_path, name, author=author or DEFAULT_AUTHOR))
             if result is None:
                 return
             if result.status == "conflict":
-                self._set_status("Merge conflict", kind="err")
                 self._show_error(
                     "Merge conflict in: " + ", ".join(result.conflicts) +
                     " — resolve, stage and commit to finish.")
@@ -820,48 +784,54 @@ def build_app():
             else:
                 self._show_ok(f"Merged {name} ({result.sha[:7]}).")
             self._refresh_branches()
+            self._load_history()
 
-        # ---- Remotes view --------------------------------------------------
-        def _build_remotes(self, parent):
-            ttk.Label(parent, text="Remotes", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(parent, style="Sub.TLabel",
-                      text="Manage remotes and sync. Network operations run in the "
-                           "background.").pack(anchor="w", pady=(0, 8))
+        # =================================================================
+        # Remotes section
+        # =================================================================
+        def _build_remotes(self, frame):
+            aura.Caption(frame,
+                         "Manage remotes and sync. Network operations run in "
+                         "the background.").pack(anchor="w", pady=(0, 10))
 
             cols = ("name", "url")
-            tree = ttk.Treeview(parent, columns=cols, show="headings", height=8,
+            tree = ttk.Treeview(frame, columns=cols, show="headings", height=8,
                                 selectmode="browse")
-            tree.heading("name", text="Name")
-            tree.heading("url", text="URL")
-            tree.column("name", width=140)
-            tree.column("url", width=520)
+            tree.heading("name", text=aura.spaced("Name"), anchor="w")
+            tree.heading("url", text=aura.spaced("URL"), anchor="w")
+            tree.column("name", width=140, anchor="w")
+            tree.column("url", width=560, anchor="w")
             tree.pack(fill="x")
             self._remote_tree = tree
 
-            add_row = ttk.Frame(parent, style="TFrame")
-            add_row.pack(fill="x", pady=(10, 0))
-            self._rname_var = tk.StringVar(value="origin")
-            self._rurl_var = tk.StringVar()
-            ttk.Label(add_row, text="Name:", style="Sub.TLabel").pack(side="left")
-            ttk.Entry(add_row, textvariable=self._rname_var, width=12).pack(
-                side="left", padx=(4, 8))
-            ttk.Label(add_row, text="URL:", style="Sub.TLabel").pack(side="left")
-            ttk.Entry(add_row, textvariable=self._rurl_var).pack(
-                side="left", fill="x", expand=True, padx=(4, 8))
-            ttk.Button(add_row, text="Add remote",
-                       command=self._on_add_remote).pack(side="left")
+            add_row = ctk.CTkFrame(frame, fg_color="transparent")
+            add_row.pack(fill="x", pady=(12, 0))
+            aura.Caption(add_row, "Name").pack(side="left", padx=(0, 4))
+            self._rname_entry = aura.AuraEntry(add_row, width=120)
+            self._rname_entry.insert(0, "origin")
+            self._rname_entry.pack(side="left", padx=(0, 10))
+            aura.Caption(add_row, "URL").pack(side="left", padx=(0, 4))
+            self._rurl_entry = aura.AuraEntry(
+                add_row, placeholder="https://example.com/repo.git")
+            self._rurl_entry.pack(side="left", fill="x", expand=True,
+                                  padx=(0, 10))
+            aura.AuraButton(add_row, "Add remote", kind="secondary",
+                            command=self._on_add_remote).pack(side="left")
 
-            ops = ttk.Frame(parent, style="TFrame")
-            ops.pack(fill="x", pady=(10, 0))
-            ttk.Button(ops, text="Fetch", command=self._on_fetch).pack(side="left")
-            ttk.Button(ops, text="Pull", command=self._on_pull).pack(
-                side="left", padx=(6, 0))
-            ttk.Button(ops, text="Push", style="Accent.TButton",
-                       command=self._on_push).pack(side="left", padx=(6, 0))
+            ops = ctk.CTkFrame(frame, fg_color="transparent")
+            ops.pack(fill="x", pady=(12, 0))
+            aura.AuraButton(ops, "Fetch", kind="secondary",
+                            command=self._on_fetch).pack(side="left")
+            aura.AuraButton(ops, "Pull", kind="secondary",
+                            command=self._on_pull).pack(side="left", padx=(8, 0))
+            aura.AuraButton(ops, "Push", kind="primary",
+                            command=self._on_push).pack(side="left", padx=(8, 0))
 
             self._refresh_remotes()
 
         def _refresh_remotes(self):
+            if not self.repo_path:
+                return
             rems = self._do(lambda: remotes(self.repo_path), success="Refreshed")
             if rems is None:
                 return
@@ -874,14 +844,14 @@ def build_app():
             sel = self._remote_tree.selection()
             if sel:
                 return self._remote_tree.item(sel[0], "values")[0]
-            return self._rname_var.get().strip() or "origin"
+            return self._rname_entry.get().strip() or "origin"
 
         def _on_add_remote(self):
-            name = self._rname_var.get().strip()
-            url = self._rurl_var.get().strip()
+            name = self._rname_entry.get().strip()
+            url = self._rurl_entry.get().strip()
             if self._do(lambda: add_remote(self.repo_path, name, url),
                         success="Remote added") is not None:
-                self._rurl_var.set("")
+                self._rurl_entry.delete(0, "end")
                 self._refresh_remotes()
 
         def _on_fetch(self):
@@ -903,6 +873,35 @@ def build_app():
                      lambda _r: self._show_ok(f"Pushed to {remote}."),
                      busy=f"Pushing to {remote}…", success="Pushed")
 
+        # =================================================================
+        # About section
+        # =================================================================
+        def _build_about(self, frame):
+            card = aura.Card(frame, title="About GitDeck")
+            card.pack(fill="x")
+            aura.Heading(card.body, APP_NAME).pack(anchor="w")
+            aura.Caption(card.body, f"Version {APP_VERSION}").pack(
+                anchor="w", pady=(0, 10))
+            ctk.CTkLabel(
+                card.body, font=aura.font(), justify="left", anchor="w",
+                wraplength=560,
+                text="A friendly, fully-offline Git client: stage and commit "
+                     "with a live diff, browse history as a commit graph, "
+                     "create / switch / merge / delete branches, and manage "
+                     "remotes with background fetch / pull / push.\n\n"
+                     "Built on pure-Python dulwich — GitDeck never shells out "
+                     "to a system git binary, so it works even where none is "
+                     "installed. 100% AI-built, open source, published on "
+                     "QuickOpen.").pack(anchor="w")
+            aura.Caption(card.body,
+                         "Licensed under Apache-2.0. Built on dulwich "
+                         "(Apache-2.0) and CustomTkinter (MIT).").pack(
+                anchor="w", pady=(10, 4))
+            aura.AuraButton(card.body, "Project page: quickopen.ai",
+                            kind="ghost",
+                            command=lambda: open_with_default_app(
+                                PROJECT_URL)).pack(anchor="w", pady=(6, 0))
+
     return App
 
 
@@ -910,8 +909,9 @@ def main():
     """Entry point: build the root window and run.  Degrades on headless hosts.
 
     Importing this module does nothing; only this function creates a Tk root.
-    With no display (e.g. a server), it prints a friendly note and returns 0
-    instead of raising, so ``gui.main()`` is safe to call anywhere.
+    With no display (e.g. a server) or without customtkinter installed, it
+    prints a friendly note and returns 0 instead of raising, so ``gui.main()``
+    is safe to call anywhere.
     """
     try:
         import tkinter as tk
@@ -923,6 +923,10 @@ def main():
     try:
         App = build_app()
         app = App()
+    except ImportError as exc:
+        print(f"{APP_NAME}: the GUI needs the 'customtkinter' package "
+              f"({exc}). Install it with:  pip install customtkinter")
+        return 0
     except tk.TclError as exc:
         # Typically "no display name and no $DISPLAY environment variable".
         print(f"{APP_NAME}: no graphical display available — cannot start the "

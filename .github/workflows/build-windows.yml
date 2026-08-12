@@ -20,8 +20,10 @@ jobs:
           pyinstaller --onefile --windowed --name GitDeck
           --icon git-deck.ico
           --version-file packaging/version.txt
+          --hidden-import gitdeck.__main__
           --add-data "git-deck.ico;."
           --collect-submodules dulwich
+          --collect-all customtkinter
           git_deck_app.py
       - name: Stage installer inputs
         shell: pwsh
@@ -41,4 +43,10 @@ jobs:
           path: |
             dist/GitDeck.exe
             packaging/dist/GitDeck-Setup.exe
+          if-no-files-found: error
+      - name: Upload staging (for signed repack)
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-deck-staging
+          path: packaging/staging
           if-no-files-found: error

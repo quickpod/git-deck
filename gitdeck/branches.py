@@ -13,6 +13,7 @@ from .errors import GitDeckError
 from .repo import open_repo, current_branch, _decode
 from .stage import DEFAULT_AUTHOR, _encode_author
 
+import os
 from collections import namedtuple
 
 # status: "up_to_date" | "merged" | "conflict"
@@ -46,6 +47,29 @@ def create_branch(path, name, base=None):
         repo.close()
 
 
+def _worktree_content_dirty(repo):
+    """True if any indexed file's *content* differs from the index.
+
+    Dulwich's checkout safety check stat-compares, and on Windows file-mode
+    semantics make clean files look modified (the ``core.filemode=false``
+    problem). Comparing blob hashes ignores stat noise.
+    """
+    from dulwich.objects import Blob
+
+    index = repo.open_index()
+    root = repo.path if isinstance(repo.path, str) else repo.path.decode()
+    for rel, entry in index.items():
+        fp = os.path.join(root, rel.decode("utf-8", "replace"))
+        try:
+            with open(fp, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return True  # deleted/unreadable counts as dirty
+        if Blob.from_string(data).id != entry.sha:
+            return True
+    return False
+
+
 def checkout(path, name, force=False):
     """Switch the working tree to branch (or commit-ish) *name*."""
     if not name or not str(name).strip():
@@ -55,6 +79,19 @@ def checkout(path, name, force=False):
         try:
             porcelain.checkout(repo, str(name), force=force)
         except porcelain.CheckoutError as exc:
+            # Windows: dulwich's stat-compare flags mode-only differences as
+            # local changes. If nothing differs by content, the tree is clean
+            # and the forced checkout is safe.
+            try:
+                clean = not _worktree_content_dirty(repo)
+            except Exception:
+                clean = False
+            if clean and not force:
+                try:
+                    porcelain.checkout(repo, str(name), force=True)
+                    return
+                except Exception as exc2:
+                    raise GitDeckError(f"Could not switch to {name!r}: {exc2}")
             raise GitDeckError(
                 f"Cannot switch to {name!r}: {exc}. Commit or stash your changes "
                 f"first (or force the checkout)."

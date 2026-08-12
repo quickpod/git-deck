@@ -76,28 +76,24 @@ def checkout(path, name, force=False):
         raise GitDeckError("A branch name is required.")
     repo = open_repo(path)
     try:
-        try:
-            porcelain.checkout(repo, str(name), force=force)
-        except porcelain.CheckoutError as exc:
-            # Windows: dulwich's stat-compare flags mode-only differences as
-            # local changes. If nothing differs by content, the tree is clean
-            # and the forced checkout is safe.
+        # Decide force up-front: dulwich's checkout safety check stat-compares,
+        # and on Windows file-mode semantics make clean tracked files look
+        # modified ("would be overwritten by checkout"). If nothing differs by
+        # content-hash the tree is clean, so a forced checkout is safe; real
+        # uncommitted content still leaves it dirty and blocks (below).
+        eff_force = force
+        if not eff_force:
             try:
-                clean = not _worktree_content_dirty(repo)
+                eff_force = not _worktree_content_dirty(repo)
             except Exception:
-                clean = False
-            if clean and not force:
-                try:
-                    porcelain.checkout(repo, str(name), force=True)
-                    return
-                except Exception as exc2:
-                    raise GitDeckError(f"Could not switch to {name!r}: {exc2}")
+                eff_force = False
+        try:
+            porcelain.checkout(repo, str(name), force=eff_force)
+        except Exception as exc:
             raise GitDeckError(
                 f"Cannot switch to {name!r}: {exc}. Commit or stash your changes "
                 f"first (or force the checkout)."
             )
-        except Exception as exc:
-            raise GitDeckError(f"Could not switch to {name!r}: {exc}")
     finally:
         repo.close()
 

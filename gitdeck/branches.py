@@ -65,7 +65,12 @@ def _worktree_content_dirty(repo):
                 data = fh.read()
         except OSError:
             return True  # deleted/unreadable counts as dirty
-        if Blob.from_string(data).id != entry.sha:
+        # Accept either the raw bytes or a CRLF→LF-normalized hash: dulwich may
+        # normalize line endings when staging on Windows, so a clean working
+        # file reads back as CRLF while its committed blob is LF.
+        raw_id = Blob.from_string(data).id
+        norm_id = Blob.from_string(data.replace(b"\r\n", b"\n")).id
+        if entry.sha not in (raw_id, norm_id):
             return True
     return False
 

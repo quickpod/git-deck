@@ -1,13 +1,14 @@
 {
   "slug": "git-deck",
   "name": "GitDeck",
-  "tagline": "A friendly desktop Git GUI \u2014 stage, commit, branch, merge and diff visually.",
+  "tagline": "A friendly desktop Git GUI — stage, commit, branch, merge and diff visually.",
   "categorySlug": "version-control",
   "license": "Apache-2.0",
-  "description": "A clean Git GUI: stage and commit with a diff view, create/switch/merge branches, browse commit history as a graph, view and revert changes, and manage remotes \u2014 all on top of a pure-Python Git implementation. Works on any local repository.",
+  "description": "A clean Git GUI: stage and commit with a diff view, create/switch/merge branches, browse commit history as a graph, view and revert changes, and manage remotes — all on top of a pure-Python Git implementation. Works on any local repository.",
   "aiStack": "Python (tkinter + CLI), dulwich (pure-Python Git)",
   "platforms": [
-    "windows"
+    "windows",
+    "linux"
   ],
   "buildEntry": "git_deck_app.py"
 }

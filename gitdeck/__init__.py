@@ -34,7 +34,7 @@ from .branches import (
 )
 from .remotes import remotes, add_remote, fetch, pull, push
 
-__version__ = "1.0.0"
+__version__ = "1.0.6"
 
 __all__ = [
     "GitDeckError",
